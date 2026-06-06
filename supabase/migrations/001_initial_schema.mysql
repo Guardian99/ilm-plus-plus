@@ -1,0 +1,227 @@
+-- ============================================
+-- ILM++ Initial Schema
+-- ============================================
+
+-- ENUM types
+create type user_role as enum (
+  'admin', 'staff', 'hv_risk', 'cc_agent', 
+  'installer', 'operations', 'finance', 'after_sales'
+);
+
+create type lead_status as enum (
+  'intake', 'consent_pending', 'load_assessment', 
+  'docs_pending', 'eligibility_check', 'product_selection',
+  'verification', 'site_visit_scheduled', 'site_visit_done',
+  'contract_pending', 'payment_pending', 'payment_confirmed',
+  'unit_assigned', 'dispatched', 'delivered', 
+  'installation_scheduled', 'installed', 'audit_pending',
+  'closed_installed', 'closed_rejected', 'closed_declined'
+);
+
+create type grid_status as enum ('on_grid', 'off_grid');
+
+-- ============================================
+-- CONFIG TABLES (admin-managed, CSV-uploadable)
+-- ============================================
+
+-- AHQ Areas (uploaded by admin via CSV)
+create table ahq_areas (
+  id uuid primary key default gen_random_uuid(),
+  code text not null unique,       -- e.g. "NRB-N"
+  name text not null,              -- e.g. "Nairobi North"
+  region text,                     -- e.g. "Nairobi"
+  is_active boolean default true,
+  created_at timestamptz default now()
+);
+
+-- Appliances (uploaded by admin via CSV)
+create table appliances (
+  id uuid primary key default gen_random_uuid(),
+  category text not null,          -- "Kitchen Appliances", "ICT", "Entertainment", etc.
+  product_name text not null,      -- "Electric Kettle - 2500 W"
+  wattage integer not null,        -- 2500
+  consumption_group text,          -- "1501-2500", "0-1000", etc.
+  is_large_appliance boolean default false,  -- max qty = 1 if true
+  is_active boolean default true,
+  created_at timestamptz default now(),
+  unique(category, product_name)
+);
+
+-- Installers (uploaded by admin via CSV)
+create table installers (
+  id uuid primary key default gen_random_uuid(),
+  name text not null,
+  phone text not null unique,
+  ahq_id uuid references ahq_areas(id),
+  is_active boolean default true,
+  created_at timestamptz default now()
+);
+
+-- Pricing Groups (form-managed by admin in UI)
+create table pricing_groups (
+  id uuid primary key default gen_random_uuid(),
+  name text not null unique,            -- "PowerHub 3.3", "PowerHub 5000"
+  site_visit_required boolean default false,
+  verification_modality text not null,  -- "call_or_video", "call_required"
+  payment_options jsonb not null,       -- ["bank_transfer", "stk", "proof_of_payment"]
+  fulfillment_model text default 'warehouse',
+  consumables_logic text default 'standard', -- "standard" or "site_survey"
+  min_kw numeric,
+  max_kw numeric,
+  base_price numeric,
+  is_active boolean default true,
+  created_at timestamptz default now()
+);
+
+-- ============================================
+-- USER PROFILES (role assignment)
+-- ============================================
+
+create table user_profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  full_name text,
+  phone text,
+  role user_role not null default 'staff',
+  ahq_id uuid references ahq_areas(id),  -- for installers
+  is_active boolean default true,
+  created_at timestamptz default now()
+);
+
+-- ============================================
+-- LEADS / PROSPECTS
+-- ============================================
+
+create table leads (
+  id uuid primary key default gen_random_uuid(),
+  
+  -- Magic link token (issued at intake)
+  magic_token text unique default encode(gen_random_bytes(32), 'hex'),
+  
+  -- Stage tracking
+  status lead_status not null default 'intake',
+  assisted_mode boolean default false,   -- agent-assisted vs self-serve
+  
+  -- Customer info (Stage 1 - Intake)
+  customer_name text not null,
+  customer_phone text not null,
+  customer_email text,
+  customer_city text,
+  customer_lat numeric,
+  customer_lng numeric,
+  customer_location_landmark text,
+  customer_occupation text,
+  grid_status grid_status,
+  preferred_contact_time text,
+  use_case text,
+  source_channel text,                   -- "field", "shop", "cc", "whatsapp"
+  
+  -- Created by (staff member who did intake)
+  created_by uuid references user_profiles(id),
+  ahq_id uuid references ahq_areas(id),
+  
+  -- Load assessment output (Stage 3)
+  load_assessment_kwh numeric,
+  load_assessment_kw numeric,
+  load_assessment_data jsonb,            -- full appliance list snapshot
+  
+  -- Eligibility (Stage 5)
+  approved_max_system text,             -- pricing group name of max approved
+  eligibility_notes text,
+  
+  -- Product selection (Stage 6)
+  selected_pricing_group_id uuid references pricing_groups(id),
+  
+  -- Verification (Stage 8)
+  verified_at timestamptz,
+  verified_by uuid references user_profiles(id),
+  
+  -- Site visit (Stage 10, PH5000 only)
+  site_visit_scheduled_at timestamptz,
+  site_visit_installer_id uuid references installers(id),
+  site_visit_completed_at timestamptz,
+  site_visit_data jsonb,                 -- photos, GPS, consumables sizing
+  site_visit_result text,               -- "feasible", "smaller_needed", "incompatible"
+  
+  -- Payment (Stage 13-14)
+  payment_reference text,
+  payment_method text,
+  payment_amount numeric,
+  payment_confirmed_at timestamptz,
+  payment_confirmed_by uuid references user_profiles(id),
+  
+  -- Dispatch (Stage 16)
+  dispatched_at timestamptz,
+  airway_bill text,
+  
+  -- Delivery (Stage 17)
+  delivery_otp text,
+  delivered_at timestamptz,
+  
+  -- Installation (Stage 19-20)
+  installation_scheduled_at timestamptz,
+  installation_installer_id uuid references installers(id),
+  installation_completed_at timestamptz,
+  installation_otp text,
+  installation_otp_confirmed_at timestamptz,
+  
+  -- Audit + warranty (Stage 21-22)
+  audit_passed_at timestamptz,
+  warranty_start_date date,
+  warranty_end_date date,
+  
+  -- Close reason
+  closed_reason text,
+  
+  -- Zendesk
+  zendesk_ticket_id text,
+  
+  -- Timestamps
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+-- Auto-update updated_at
+create or replace function update_updated_at()
+returns trigger as $$
+begin
+  new.updated_at = now();
+  return new;
+end;
+$$ language plpgsql;
+
+create trigger leads_updated_at
+  before update on leads
+  for each row execute function update_updated_at();
+
+-- ============================================
+-- LEAD APPLIANCES (load assessment line items)
+-- ============================================
+
+create table lead_appliances (
+  id uuid primary key default gen_random_uuid(),
+  lead_id uuid references leads(id) on delete cascade,
+  appliance_id uuid references appliances(id),
+  product_name text not null,           -- snapshot at time of assessment
+  category text not null,
+  wattage integer not null,
+  quantity integer not null default 1,
+  utilization_day_minutes integer default 0,
+  utilization_night_minutes integer default 0,
+  energy_day_wh numeric default 0,
+  energy_night_wh numeric default 0,
+  energy_total_wh numeric default 0,
+  peak_power_w numeric default 0,
+  created_at timestamptz default now()
+);
+
+-- ============================================
+-- INDEXES
+-- ============================================
+
+create index on leads(customer_phone);
+create index on leads(magic_token);
+create index on leads(status);
+create index on leads(ahq_id);
+create index on lead_appliances(lead_id);
+create index on appliances(category);
+create index on installers(ahq_id);
